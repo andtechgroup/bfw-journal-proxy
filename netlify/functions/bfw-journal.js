@@ -1,6 +1,6 @@
 // netlify/functions/bfw-journal.js
 
-const DEFAULT_TARGET = "https://www.bonefidewealth.com/journal?format=json";
+const DEFAULT_TARGET = "https://www.bonefidewealth.com/media-library?format=json";
 const ALLOWED_HOSTS = new Set(["www.bonefidewealth.com", "bonefidewealth.com"]);
 
 // If you want to lock this down, set this in Netlify env vars:
