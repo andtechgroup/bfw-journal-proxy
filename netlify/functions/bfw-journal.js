@@ -2,6 +2,7 @@
 
 const DEFAULT_TARGET = "https://bonefidewealth.com/media-library?format=json";
 const ALLOWED_HOSTS = new Set(["www.bonefidewealth.com", "bonefidewealth.com"]);
+const REQUIRED_TAG = "Money Together";
 
 // If you want to lock this down, set this in Netlify env vars:
 // ALLOWED_ORIGIN=https://domoneytogether.com
@@ -25,6 +26,28 @@ function isAllowedTarget(urlString) {
   }
 }
 
+function hasRequiredTag(item) {
+  return Array.isArray(item?.tags) &&
+    item.tags.some((tag) => {
+      return String(tag).trim().toLowerCase() === REQUIRED_TAG.toLowerCase();
+    });
+}
+
+function filterItemsByTag(json) {
+  if (!Array.isArray(json?.items)) return json;
+
+  const filteredItems = json.items.filter(hasRequiredTag);
+
+  return {
+    ...json,
+    items: filteredItems,
+    collection: {
+      ...json.collection,
+      itemCount: filteredItems.length,
+    },
+  };
+}
+
 function rewriteNextPageUrl(json, proxyBaseUrl) {
   // Squarespace JSON usually has: json.pagination.nextPageUrl
   const next = json?.pagination?.nextPageUrl;
@@ -32,6 +55,7 @@ function rewriteNextPageUrl(json, proxyBaseUrl) {
 
   // Route nextPageUrl back through this proxy via ?url=...
   const proxied = `${proxyBaseUrl}?url=${encodeURIComponent(next)}`;
+
   return {
     ...json,
     pagination: {
@@ -88,7 +112,7 @@ exports.handler = async (event) => {
     let body = text;
     let contentType = upstream.headers.get("content-type") || "application/json";
 
-    // Attempt JSON parse and rewrite pagination URLs
+    // Attempt JSON parse, filter tagged items, and rewrite pagination URLs
     try {
       const parsed = JSON.parse(text);
 
@@ -102,7 +126,9 @@ exports.handler = async (event) => {
       const proto = event.headers["x-forwarded-proto"] || "https";
       const proxyBaseUrl = `${proto}://${host}/.netlify/functions/bfw-journal`;
 
-      const rewritten = rewriteNextPageUrl(parsed, proxyBaseUrl);
+      const filtered = filterItemsByTag(parsed);
+      const rewritten = rewriteNextPageUrl(filtered, proxyBaseUrl);
+
       body = JSON.stringify(rewritten);
       contentType = "application/json";
     } catch {
