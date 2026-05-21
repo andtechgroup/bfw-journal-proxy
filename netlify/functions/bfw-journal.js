@@ -3,9 +3,8 @@
 const DEFAULT_TARGET = "https://bonefidewealth.com/media-library?format=json";
 const ALLOWED_HOSTS = new Set(["www.bonefidewealth.com", "bonefidewealth.com"]);
 const REQUIRED_TAG = "Money Together";
+const MAX_PAGES = 10;
 
-// If you want to lock this down, set this in Netlify env vars:
-// ALLOWED_ORIGIN=https://domoneytogether.com
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
 function corsHeaders() {
@@ -26,47 +25,87 @@ function isAllowedTarget(urlString) {
   }
 }
 
-function hasRequiredTag(item) {
-  return Array.isArray(item?.tags) &&
-    item.tags.some((tag) => {
-      return String(tag).trim().toLowerCase() === REQUIRED_TAG.toLowerCase();
-    });
+function normalizeUrl(urlString, baseUrl) {
+  return new URL(urlString, baseUrl).toString();
 }
 
-function filterItemsByTag(json) {
-  if (!Array.isArray(json?.items)) return json;
+function hasRequiredTag(item) {
+  return Array.isArray(item?.tags) &&
+    item.tags.some(tag =>
+      String(tag).trim().toLowerCase() === REQUIRED_TAG.toLowerCase()
+    );
+}
 
-  const filteredItems = json.items.filter(hasRequiredTag);
+function removePagination(json) {
+  const cleaned = { ...json };
+  delete cleaned.pagination;
+  return cleaned;
+}
+
+async function fetchJson(url) {
+  const upstream = await fetch(url, {
+    headers: {
+      "User-Agent": "domoneytogether-netlify-proxy",
+      "Accept": "application/json,text/plain,*/*",
+    },
+  });
+
+  const text = await upstream.text();
+
+  if (!upstream.ok) {
+    throw new Error(`Upstream returned ${upstream.status}: ${text.slice(0, 200)}`);
+  }
+
+  return JSON.parse(text);
+}
+
+async function fetchAllCollectionPages(startUrl) {
+  let currentUrl = startUrl;
+  let pageCount = 0;
+  let firstPage = null;
+  const allItems = [];
+
+  while (currentUrl && pageCount < MAX_PAGES) {
+    if (!isAllowedTarget(currentUrl)) {
+      throw new Error(`Blocked disallowed pagination URL: ${currentUrl}`);
+    }
+
+    const pageJson = await fetchJson(currentUrl);
+
+    if (!firstPage) {
+      firstPage = pageJson;
+    }
+
+    if (Array.isArray(pageJson.items)) {
+      allItems.push(...pageJson.items);
+    }
+
+    const nextPageUrl = pageJson?.pagination?.nextPageUrl;
+
+    currentUrl = nextPageUrl
+      ? normalizeUrl(nextPageUrl, currentUrl)
+      : null;
+
+    pageCount += 1;
+  }
+
+  if (!firstPage) {
+    throw new Error("No collection data returned from upstream.");
+  }
+
+  const filteredItems = allItems.filter(hasRequiredTag);
 
   return {
-    ...json,
+    ...removePagination(firstPage),
     items: filteredItems,
     collection: {
-      ...json.collection,
+      ...firstPage.collection,
       itemCount: filteredItems.length,
     },
   };
 }
 
-function rewriteNextPageUrl(json, proxyBaseUrl) {
-  // Squarespace JSON usually has: json.pagination.nextPageUrl
-  const next = json?.pagination?.nextPageUrl;
-  if (!next) return json;
-
-  // Route nextPageUrl back through this proxy via ?url=...
-  const proxied = `${proxyBaseUrl}?url=${encodeURIComponent(next)}`;
-
-  return {
-    ...json,
-    pagination: {
-      ...json.pagination,
-      nextPageUrl: proxied,
-    },
-  };
-}
-
 exports.handler = async (event) => {
-  // Handle preflight
   if (event.httpMethod === "OPTIONS") {
     return {
       statusCode: 204,
@@ -86,7 +125,6 @@ exports.handler = async (event) => {
     };
   }
 
-  // Allow pagination passthrough: /.netlify/functions/bfw-journal?url=<nextPageUrl>
   const target = event.queryStringParameters?.url || DEFAULT_TARGET;
 
   if (!isAllowedTarget(target)) {
@@ -98,58 +136,25 @@ exports.handler = async (event) => {
   }
 
   try {
-    const upstream = await fetch(target, {
-      headers: {
-        // Helps some origin servers respond consistently
-        "User-Agent": "domoneytogether-netlify-proxy",
-        "Accept": "application/json,text/plain,*/*",
-      },
-    });
-
-    const text = await upstream.text();
-
-    // If upstream isn't JSON for some reason, pass through for debugging
-    let body = text;
-    let contentType = upstream.headers.get("content-type") || "application/json";
-
-    // Attempt JSON parse, filter tagged items, and rewrite pagination URLs
-    try {
-      const parsed = JSON.parse(text);
-
-      // Build absolute proxy URL for rewriting pagination
-      // event.rawUrl exists in Netlify runtime; fallback to host header.
-      const host =
-        event.headers["x-forwarded-host"] ||
-        event.headers.host ||
-        "localhost:8888";
-
-      const proto = event.headers["x-forwarded-proto"] || "https";
-      const proxyBaseUrl = `${proto}://${host}/.netlify/functions/bfw-journal`;
-
-      const filtered = filterItemsByTag(parsed);
-      const rewritten = rewriteNextPageUrl(filtered, proxyBaseUrl);
-
-      body = JSON.stringify(rewritten);
-      contentType = "application/json";
-    } catch {
-      // ignore parse error and return raw text
-    }
+    const json = await fetchAllCollectionPages(target);
 
     return {
-      statusCode: upstream.status,
+      statusCode: 200,
       headers: {
         ...corsHeaders(),
-        "Content-Type": contentType,
-        // Cache for 5 minutes (tweak as desired)
+        "Content-Type": "application/json",
         "Cache-Control": "public, max-age=300",
       },
-      body,
+      body: JSON.stringify(json),
     };
   } catch (err) {
     return {
       statusCode: 502,
-      headers: corsHeaders(),
-      body: `Upstream fetch failed: ${err?.message || String(err)}`,
+      headers: {
+        ...corsHeaders(),
+        "Content-Type": "text/plain",
+      },
+      body: `Proxy fetch failed: ${err?.message || String(err)}`,
     };
   }
 };
