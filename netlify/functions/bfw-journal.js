@@ -30,7 +30,11 @@ function isAllowedTarget(urlString) {
 }
 
 function normalizeUrl(urlString, baseUrl) {
-  return new URL(urlString, baseUrl).toString();
+  const u = new URL(urlString, baseUrl);
+  // Squarespace's pagination.nextPageUrl drops the ?format=json query param,
+  // which causes the upstream to serve HTML instead of JSON. Restore it.
+  u.searchParams.set("format", "json");
+  return u.toString();
 }
 
 function hasRequiredTag(item) {
