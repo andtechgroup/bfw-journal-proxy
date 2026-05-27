@@ -1,11 +1,15 @@
 // netlify/functions/bfw-journal.js
-
 const DEFAULT_TARGET = "https://bonefidewealth.com/media-library?format=json";
 const ALLOWED_HOSTS = new Set(["www.bonefidewealth.com", "bonefidewealth.com"]);
 const REQUIRED_TAG = "Money Together";
 const MAX_PAGES = 10;
-
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+
+// Realistic browser User-Agent prevents Squarespace from returning an HTML
+// challenge page or default HTML to requests it doesn't recognize.
+const BROWSER_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
+  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 function corsHeaders() {
   return {
@@ -42,21 +46,77 @@ function removePagination(json) {
   return cleaned;
 }
 
-async function fetchJson(url) {
-  const upstream = await fetch(url, {
-    headers: {
-      "User-Agent": "domoneytogether-netlify-proxy",
-      "Accept": "application/json,text/plain,*/*",
-    },
-  });
+/**
+ * Custom error class so we can preserve diagnostic context (URL, status,
+ * preview of the body) all the way back to the handler for logging.
+ */
+class UpstreamError extends Error {
+  constructor(message, ctx) {
+    super(message);
+    this.name = "UpstreamError";
+    this.ctx = ctx || {};
+  }
+}
 
+async function fetchJson(url) {
+  let upstream;
+  try {
+    upstream = await fetch(url, {
+      headers: {
+        "User-Agent": BROWSER_UA,
+        "Accept": "application/json,text/plain,*/*",
+      },
+      redirect: "follow",
+    });
+  } catch (e) {
+    throw new UpstreamError("Network error reaching upstream", {
+      url,
+      cause: String(e),
+    });
+  }
+
+  const contentType = upstream.headers.get("content-type") || "";
   const text = await upstream.text();
 
   if (!upstream.ok) {
-    throw new Error(`Upstream returned ${upstream.status}: ${text.slice(0, 200)}`);
+    throw new UpstreamError(
+      `Upstream returned HTTP ${upstream.status}`,
+      {
+        url,
+        status: upstream.status,
+        contentType,
+        bodyPreview: text.slice(0, 300),
+      }
+    );
   }
 
-  return JSON.parse(text);
+  // Guard against Squarespace returning an HTML page when we expected JSON
+  // (happens with bot UAs, IP blocks, or invalid URLs that render a 404 page
+  // with a 200 status — yes, really).
+  const trimmed = text.trimStart();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+    throw new UpstreamError(
+      "Upstream returned non-JSON content",
+      {
+        url,
+        status: upstream.status,
+        contentType,
+        bodyPreview: text.slice(0, 300),
+      }
+    );
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new UpstreamError("Upstream returned malformed JSON", {
+      url,
+      status: upstream.status,
+      contentType,
+      bodyPreview: text.slice(0, 300),
+      cause: String(e),
+    });
+  }
 }
 
 async function fetchAllCollectionPages(startUrl) {
@@ -67,30 +127,19 @@ async function fetchAllCollectionPages(startUrl) {
 
   while (currentUrl && pageCount < MAX_PAGES) {
     if (!isAllowedTarget(currentUrl)) {
-      throw new Error(`Blocked disallowed pagination URL: ${currentUrl}`);
+      throw new UpstreamError("Blocked disallowed pagination URL", { url: currentUrl });
     }
-
     const pageJson = await fetchJson(currentUrl);
-
-    if (!firstPage) {
-      firstPage = pageJson;
-    }
-
-    if (Array.isArray(pageJson.items)) {
-      allItems.push(...pageJson.items);
-    }
+    if (!firstPage) firstPage = pageJson;
+    if (Array.isArray(pageJson.items)) allItems.push(...pageJson.items);
 
     const nextPageUrl = pageJson?.pagination?.nextPageUrl;
-
-    currentUrl = nextPageUrl
-      ? normalizeUrl(nextPageUrl, currentUrl)
-      : null;
-
+    currentUrl = nextPageUrl ? normalizeUrl(nextPageUrl, currentUrl) : null;
     pageCount += 1;
   }
 
   if (!firstPage) {
-    throw new Error("No collection data returned from upstream.");
+    throw new UpstreamError("No collection data returned from upstream", { url: startUrl });
   }
 
   const filteredItems = allItems.filter(hasRequiredTag);
@@ -137,7 +186,6 @@ exports.handler = async (event) => {
 
   try {
     const json = await fetchAllCollectionPages(target);
-
     return {
       statusCode: 200,
       headers: {
@@ -148,13 +196,26 @@ exports.handler = async (event) => {
       body: JSON.stringify(json),
     };
   } catch (err) {
+    // Log the full context to Netlify's function logs for debugging
+    const ctx = err instanceof UpstreamError ? err.ctx : {};
+    console.error("bfw-journal failure:", {
+      message: err?.message || String(err),
+      ...ctx,
+    });
+
+    // Return a structured JSON error so the client (and you, when curl'ing
+    // the function) gets useful diagnostics instead of just a parse failure.
     return {
       statusCode: 502,
       headers: {
         ...corsHeaders(),
-        "Content-Type": "text/plain",
+        "Content-Type": "application/json",
       },
-      body: `Proxy fetch failed: ${err?.message || String(err)}`,
+      body: JSON.stringify({
+        error: "Proxy fetch failed",
+        message: err?.message || String(err),
+        ...ctx,
+      }),
     };
   }
 };
